@@ -1,44 +1,47 @@
 # ppt_summary_app_with_chatbot.py
 """
-Streamlit PPT Summarizer, Design Assistant & Conversational Chatbot
+Streamlit PPT Summarizer, Design Assistant & Conversational Chatbot
 ───────────────────────────────────────────────────────────────────
 • Upload a PowerPoint → get deck summary, context, per‑slide insights
-• Suggests layouts, charts, visuals, colour schemes **(kept from v1)**
-• NEW: built‑in chatbot that answers user questions about the deck
+• Suggests layouts, charts, visuals, colour schemes
+• Built‑in chatbot that answers questions about the deck
 """
 
-# ── std‑lib ─────────────────────────────────────────────────────────
+# ─── IMPORTS ──────────────────────────────────────────────────────────────────
 from io import BytesIO
 from typing import List, Dict, Any, Tuple
-import os, json, time, requests
-# ── 3rd‑party ──────────────────────────────────────────────────────
+import os, json, time, requests, re
 import streamlit as st
 from pptx import Presentation
 from dotenv import load_dotenv
 from openai import AzureOpenAI
-import hydralit_components as hc
-# ──────────────────────────────────────────────────────────────────
 
-# ╭─────────────────────  Azure OpenAI config  ─────────────────────╮
+# Handle hydralit_components import gracefully
+try:
+    import hydralit_components as hc
+    HYDRALIT_AVAILABLE = True
+except ImportError:
+    HYDRALIT_AVAILABLE = False
+    st.warning("Advanced navigation features disabled (hydralit_components not available)")
+
+# ─── CONFIGURATION ───────────────────────────────────────────────────────────
 load_dotenv()
-AZURE_API_KEY  = os.getenv("AZURE_OPENAI_API_KEY")
+AZURE_API_KEY = os.getenv("AZURE_OPENAI_API_KEY")
 AZURE_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
-API_VERSION    = os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-15-preview")
-CHAT_MODEL     = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", "gpt-4o-mini")
-IMAGE_MODEL    = os.getenv("AZURE_OPENAI_IMAGE_DEPLOYMENT_NAME", "dall-e-3")
-DEBUG_MODE     = os.getenv("DEBUG_MODE", "False").lower() == "true"
-# ╰─────────────────────────────────────────────────────────────────╯
+API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-15-preview")
+CHAT_MODEL = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", "gpt-4")
+DEBUG_MODE = os.getenv("DEBUG_MODE", "False").lower() == "true"
 
-# ──────────────────── Azure helper functions ─────────────────────
+# ─── AZURE HELPERS ───────────────────────────────────────────────────────────
 @st.cache_resource(show_spinner=False)
 def get_client():
     if not AZURE_API_KEY or not AZURE_ENDPOINT:
         st.error("🚨 Missing Azure credentials. Set env vars.")
         st.stop()
     return AzureOpenAI(
-        api_key        = AZURE_API_KEY,
-        azure_endpoint = AZURE_ENDPOINT,
-        api_version    = API_VERSION,
+        api_key=AZURE_API_KEY,
+        azure_endpoint=AZURE_ENDPOINT,
+        api_version=API_VERSION,
     )
 
 @st.cache_data(show_spinner=False)
@@ -50,18 +53,17 @@ def smoke_test():
         st.stop()
     return resp.json().get("data", [])
 
-# unified chat helper with tiny retry
 def chat(system: str, user: str, temperature: float = 0.3, max_attempts: int = 2) -> str:
     client = get_client()
     for attempt in range(max_attempts):
         try:
             resp = client.chat.completions.create(
-                model       = CHAT_MODEL,
-                messages    = [
+                model=CHAT_MODEL,
+                messages=[
                     {"role": "system", "content": system},
-                    {"role": "user",   "content": user},
+                    {"role": "user", "content": user},
                 ],
-                temperature = temperature,
+                temperature=temperature,
             )
             return resp.choices[0].message.content.strip()
         except Exception:
@@ -69,7 +71,7 @@ def chat(system: str, user: str, temperature: float = 0.3, max_attempts: int = 2
                 raise
             time.sleep(1.5)
 
-# ────────────────────── Slide extraction ––––––––––––––––––––––––––
+# ─── SLIDE PROCESSING ────────────────────────────────────────────────────────
 def extract_slide_data(ppt_io: BytesIO) -> List[Dict[str, Any]]:
     prs = Presentation(ppt_io)
     data = []
@@ -88,62 +90,72 @@ def extract_slide_data(ppt_io: BytesIO) -> List[Dict[str, Any]]:
         })
     return data
 
-# ────────────────────── Visual‑prompt helpers (unchanged) ─────────
-def generate_enhanced_image_prompt(slide_summary: str, context: Dict[str, str]) -> str:
-    system = (
-        "Act like a design consultant. Suggest creative, non‑generic visuals "
-        "for high‑level/government audiences. Return only the prompt text."
-    )
-    user = (
-        f"Create an image prompt for this slide:\n\n{slide_summary}\n\n"
-        f"Context → Topic: {context.get('topic','–')}; Region: {context.get('region','–')}; "
-        f"Purpose: {context.get('purpose','–')}. Make it region‑specific."
-    )
-    return chat(system, user, 0.7)
-
-def generate_second_image_option(slide_summary: str, context: Dict[str, str], first_prompt: str) -> str:
-    system = (
-        "Act like a design consultant. Suggest an ALTERNATIVE visual distinct from the first one "
-        "for the same high‑level audience. Return only the prompt."
-    )
-    user = (
-        f"Alt image prompt for slide:\n\n{slide_summary}\n\nContext → Topic: {context.get('topic','–')}; "
-        f"Region: {context.get('region','–')}; Purpose: {context.get('purpose','–')}."
-        f" Previous suggestion: {first_prompt}."
-    )
-    return chat(system, user, 0.8)
-
-def suggest_chart_type(slide_content: str) -> str:
-    system = (
-        "You are a data‑viz expert. If a chart suits this content, name the type and why. "
-        "Else say no chart needed and suggest another visual."
-    )
-    return chat(system, slide_content, 0.4)
-
-def suggest_layout(slide_content: str) -> str:
-    system = (
-        "Consulting‑style slide coach: recommend optimal layout/structure for clarity and impact."
-    )
-    return chat(system, slide_content, 0.4)
-
-# ────────────────────── Context & summaries ───────────────────────
+# ─── CONTEXT EXTRACTION ──────────────────────────────────────────────────────
 @st.cache_data(show_spinner=False, ttl=3600)
 def identify_context(slides: List[Dict[str, Any]]) -> Dict[str, str]:
-    block = []
-    for d in slides[:min(5, len(slides))]:
-        b = f"Slide {d['slide_number']} content:\n{d['slide_text']}"
+    # Extract first few slides plus title/agenda slides
+    context_slides = []
+    for d in slides[:min(7, len(slides))]:
+        if d['slide_text'].strip():
+            context_slides.append(d)
+    
+    # Build context blocks with prioritized content
+    context_blocks = []
+    for d in context_slides:
+        is_title_slide = (d['slide_number'] == 1) or ("title" in d['slide_text'].lower())
+        block = f"Slide {d['slide_number']}:"
+        if is_title_slide:
+            block = "🔹 TITLE SLIDE:\n" + d['slide_text']
+        elif "agenda" in d['slide_text'].lower():
+            block = "🔸 AGENDA SLIDE:\n" + d['slide_text']
+        else:
+            block += "\n" + d['slide_text']
         if d["has_notes"]:
-            b += f"\n\nNotes:\n{d['notes_text']}"
-        block.append(b)
-    raw = chat(
-        "Return JSON with keys topic, region, purpose inferred from the slides below.",
-        "\n\n".join(block),
-    )
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        return {k: "Unknown" for k in ("topic", "region", "purpose")}
+            block += f"\nNOTES: {d['notes_text']}"
+        context_blocks.append(block)
+    
+    # Enhanced system prompt
+    system_prompt = """Extract presentation metadata as JSON with:
+    - topic: Specific subject (e.g., "2024 Marketing Strategy")
+    - region: Geographic focus if mentioned
+    - purpose: Only from: inform|persuade|propose|educate|report|pitch|review
+    
+    Rules:
+    1. Be SPECIFIC - avoid generic terms
+    2. For purpose, ONLY use allowed values
+    3. Return ONLY valid JSON like:
+    {"topic": "...", "region": "...", "purpose": "..."}"""
+    
+    # Get raw response with retries
+    for attempt in range(3):
+        try:
+            raw = chat(
+                system_prompt,
+                "SLIDE CONTENT:\n\n" + "\n".join(context_blocks),
+                temperature=0.2
+            )
+            context = json.loads(raw)
+            
+            # Validate and clean
+            context = {
+                "topic": context.get("topic", "Unknown").strip() or "Unknown",
+                "region": context.get("region", "Unknown").strip() or "Unknown",
+                "purpose": context.get("purpose", "Unknown").strip().lower()
+            }
+            
+            # Validate purpose
+            allowed_purposes = {"inform", "persuade", "propose", "educate", "report", "pitch", "review"}
+            if context["purpose"] not in allowed_purposes:
+                context["purpose"] = "Unknown"
+                
+            return context
+            
+        except (json.JSONDecodeError, ValueError):
+            if attempt == 2:  # Final attempt
+                return {"topic": "Unknown", "region": "Unknown", "purpose": "Unknown"}
+            time.sleep(1)
 
+# ─── SUMMARY GENERATION ──────────────────────────────────────────────────────
 @st.cache_data(show_spinner=False)
 def summarize_deck(slides: List[Dict[str, Any]]) -> Tuple[str, Dict[str, str], List[str], List[str], List[str], List[str]]:
     ctx = identify_context(slides)
@@ -153,192 +165,201 @@ def summarize_deck(slides: List[Dict[str, Any]]) -> Tuple[str, Dict[str, str], L
         if d["has_notes"]:
             segment += f"\n\nNotes:\n{d['notes_text']}"
         full.append(segment)
-    deck_summary = chat("Expert analyst. Summarise deck <100 words.", "\n\n".join(full))
+    
+    deck_summary = chat(
+        "Summarize this presentation in <100 words for a busy executive.",
+        "\n\n".join(full)
+    )
+    
     slide_sums, design_notes, layouts, charts = [], [], [], []
     for d in slides:
         prompt = f"Slide content: {d['slide_text']}" + (f"\nNotes: {d['notes_text']}" if d["has_notes"] else "")
-        resp = chat("Give 1.Summary ≤40w 2.Design Tips ≤40w", prompt)
-        p = resp.split("2.")
-        slide_sums.append(p[0].replace("1.", "").strip() if p else resp)
-        design_notes.append(p[1].strip() if len(p) > 1 else "—")
+        resp = chat(
+            "Provide:\n1. Key point (≤30 words)\n2. Design tip (≤20 words)",
+            prompt
+        )
+        parts = resp.split("2.")
+        slide_sums.append(parts[0].replace("1.", "").strip() if parts else resp)
+        design_notes.append(parts[1].strip() if len(parts) > 1 else "—")
         layouts.append(suggest_layout(prompt))
         charts.append(suggest_chart_type(prompt))
+    
     return deck_summary, ctx, slide_sums, design_notes, layouts, charts
 
-# ───────────────────── Chatbot corpus helper ──────────────────────
-def build_chat_corpus(deck_sum: str, ctx: Dict[str, str],
-                      slide_sums: List[str], design: List[str],
-                      layouts: List[str], charts: List[str],
-                      slides: List[Dict[str, Any]]) -> str:
-    bits = [f"Presentation context: {json.dumps(ctx)}", f"Deck summary: {deck_sum}"]
-    for i, d in enumerate(slides):
-        block = [f"Slide {d['slide_number']}", f"Content: {d['slide_text']}"]
-        if d["has_notes"]:
-            block.append(f"Notes: {d['notes_text']}")
-        block.extend([
-            f"Summary: {slide_sums[i]}",
-            f"Design tips: {design[i]}",
-            f"Layout suggestion: {layouts[i]}",
-            f"Chart suggestion: {charts[i]}",
-        ])
-        bits.append("\n".join(block))
-    return "\n\n".join(bits)
+# ─── DESIGN HELPERS ──────────────────────────────────────────────────────────
+def suggest_layout(slide_content: str) -> str:
+    return chat(
+        "Recommend a slide layout for consulting-style presentations. Be specific about element placement.",
+        slide_content,
+        temperature=0.4
+    )
 
-# ─────────────────────────── Streamlit UI ─────────────────────────
+def suggest_chart_type(slide_content: str) -> str:
+    return chat(
+        "Suggest the best chart type for this content. If no chart fits, recommend an alternative visual.",
+        slide_content,
+        temperature=0.4
+    )
+
+def generate_image_prompt(slide_summary: str, context: Dict[str, str]) -> str:
+    return chat(
+        "Create a detailed image prompt for a professional presentation slide.",
+        f"Content: {slide_summary}\nContext: {json.dumps(context)}",
+        temperature=0.7
+    )
+
+# ─── UI COMPONENTS ───────────────────────────────────────────────────────────
+def display_context(ctx: Dict[str, str]):
+    with st.expander("🔍 Presentation Context", expanded=True):
+        cols = st.columns(3)
+        
+        # Topic
+        with cols[0]:
+            st.markdown("### 📌 Topic")
+            if ctx['topic'] == 'Unknown':
+                new_topic = st.text_input("Enter topic", key="topic_input")
+                if new_topic:
+                    ctx['topic'] = new_topic
+            else:
+                st.success(ctx['topic'])
+        
+        # Region
+        with cols[1]:
+            st.markdown("### 🌍 Region")
+            if ctx['region'] == 'Unknown':
+                st.info("Not specified")
+            else:
+                st.success(ctx['region'])
+        
+        # Purpose
+        with cols[2]:
+            st.markdown("### 🎯 Purpose")
+            purpose_icons = {
+                "inform": "📢 Inform",
+                "persuade": "🫵 Persuade",
+                "propose": "📑 Propose",
+                "educate": "🎓 Educate",
+                "report": "📈 Report",
+                "pitch": "🤝 Pitch",
+                "review": "🔍 Review",
+                "Unknown": "❓ Unknown"
+            }
+            st.markdown(purpose_icons.get(ctx['purpose'], "❓") + " " + ctx['purpose'].capitalize())
+
+# ─── MAIN APP ────────────────────────────────────────────────────────────────
 def main():
     st.set_page_config(
         "PPT Assistant", 
         layout="wide",
-        page_icon="📊"
+        page_icon="📊",
+        initial_sidebar_state="expanded"
     )
     
-    # Custom CSS for better styling
+    # Custom CSS
     st.markdown("""
     <style>
-        .sidebar .sidebar-content {
-            background-color: #f8f9fa;
-        }
-        .status-box {
-            border-radius: 0.5rem;
-            padding: 1rem;
-            margin-bottom: 1rem;
-            background-color: #f0f2f6;
-        }
-        .status-header {
-            font-size: 1.1rem;
-            font-weight: 600;
-            margin-bottom: 0.5rem;
-            color: #2c3e50;
-        }
-        .status-value {
-            font-family: monospace;
-            word-break: break-word;
-        }
-        .slide-nav {
-            margin-bottom: 2rem;
-        }
-        .chat-message {
-            border-radius: 0.5rem;
-            padding: 0.75rem;
-            margin: 0.5rem 0;
-        }
-        .user-message {
-            background-color: #e3f2fd;
-        }
-        .assistant-message {
-            background-color: #f5f5f5;
-        }
+        .stApp { background-color: #f8f9fa; }
+        .sidebar .sidebar-content { background-color: #ffffff; }
+        .stButton>button { width: 100%; }
+        .stExpander { background-color: white; border-radius: 8px; }
+        .stChatMessage { border-radius: 12px; padding: 1rem; }
     </style>
     """, unsafe_allow_html=True)
-
-    # Main title with icon
-    st.title("📊 PPT Summarizer, Design Assistant & Chatbot")
-    st.caption("Upload a PowerPoint deck to get summaries, design suggestions, and chat with an AI assistant")
-
-    # Enhanced sidebar with Azure status
+    
+    # Sidebar
     with st.sidebar:
-        st.subheader("🔌 Azure OpenAI Status")
+        st.title("⚙️ Settings")
         
-        # Connection status indicator
-        status_container = st.container()
-        
-        if AZURE_API_KEY and AZURE_ENDPOINT:
-            try:
-                deployments = smoke_test()
-                status_container.success("✅ Connected to Azure OpenAI")
-                
-                # Display deployment info in expander
-                with st.expander("🔍 Deployment Details"):
-                    st.markdown(f"**API Version:** `{API_VERSION}`")
-                    st.markdown(f"**Chat Model:** `{CHAT_MODEL}`")
+        # Azure Status
+        with st.container(border=True):
+            st.subheader("Azure Status")
+            if AZURE_API_KEY and AZURE_ENDPOINT:
+                try:
+                    deployments = smoke_test()
+                    st.success("✅ Connected")
                     if DEBUG_MODE:
-                        st.markdown("**Debug Info:**")
-                        st.code(f"Endpoint: {AZURE_ENDPOINT}")
-                        if deployments:
-                            st.markdown("**Available Deployments:**")
-                            for dep in deployments:
-                                st.code(f"{dep.get('model')} (id: {dep.get('id')})")
-            except Exception as e:
-                status_container.error(f"❌ Connection failed: {str(e)}")
-        else:
-            status_container.error("❌ Missing Azure credentials")
+                        st.markdown(f"**Model:** {CHAT_MODEL}")
+                        st.markdown(f"**API Version:** {API_VERSION}")
+                except Exception as e:
+                    st.error(f"❌ Connection failed: {str(e)}")
+            else:
+                st.error("❌ Missing credentials")
         
-        # File upload section in sidebar
+        # File Upload
         st.divider()
-        st.subheader("📂 Upload PPTX")
         ppt = st.file_uploader(
-            "Choose a PowerPoint file", 
+            "Upload PowerPoint", 
             type=["pptx"],
-            label_visibility="collapsed"
+            help="Upload a .pptx file to analyze"
         )
-        
-        # Debug info (only shown in debug mode)
-        if DEBUG_MODE:
-            st.divider()
-            st.subheader("🔧 Debug Info")
-            st.markdown(f"**Session State Keys:**")
-            st.write(list(st.session_state.keys()))
-
-    # Main content area
-    if ppt is None:
-        st.info("⬆️ Upload a PowerPoint deck using the sidebar to get started")
+    
+    # Main Content
+    st.title("📊 PowerPoint Analysis Suite")
+    
+    if not ppt:
+        st.info("👈 Upload a PowerPoint file to begin")
         return
-
-    # Clear session state if new file
+    
+    # Clear session if new file
     if st.session_state.get("_current_file") != ppt.name:
         st.session_state.clear()
         st.session_state._current_file = ppt.name
-
-    # Extract slides
+    
+    # Process slides
     slides = extract_slide_data(ppt)
-    st.info(f"📑 Found {len(slides)} slides • 📝 {sum(s['has_notes'] for s in slides)} with notes")
-
-    # Analyse button
-    if st.button("🚀 Analyse deck", type="primary") or "summaries" in st.session_state:
+    st.success(f"✔️ Loaded {len(slides)} slides")
+    
+    # Analysis
+    if st.button("🚀 Analyze Presentation", type="primary") or "summaries" in st.session_state:
         if "summaries" not in st.session_state:
-            with st.spinner("🔍 Analysing deck with Azure (this may take a minute)..."):
+            with st.spinner("Analyzing presentation content..."):
                 st.session_state.summaries = summarize_deck(slides)
+        
         deck_sum, ctx, slide_sums, design_notes, layouts, charts = st.session_state.summaries
-
-        # build corpus once
-        if "corpus" not in st.session_state:
-            st.session_state.corpus = build_chat_corpus(deck_sum, ctx, slide_sums, design_notes, layouts, charts, slides)
-
-        # Presentation context + summary
-        with st.expander("📌 Deck Overview", expanded=True):
-            cols = st.columns(3)
-            cols[0].markdown(f"**📌 Topic:** {ctx.get('topic','–')}")
-            cols[1].markdown(f"**🌍 Region:** {ctx.get('region','–')}")
-            cols[2].markdown(f"**🎯 Purpose:** {ctx.get('purpose','–')}")
-            st.markdown("**📋 Summary:**")
+        
+        # Display Context
+        display_context(ctx)
+        
+        # Deck Summary
+        with st.expander("📝 Executive Summary", expanded=True):
             st.write(deck_sum)
         
+        # Slide Navigation
         st.divider()
-
-        # Slide navigator
-        st.markdown("## Slide Analysis")
-        menu = [{"id": i, "label": f"Slide {d['slide_number']}", "icon": "bi-easel"} for i, d in enumerate(slides)]
-        sel = hc.nav_bar(menu, sticky_mode="pinned", key="nav")
-        idx = sel if isinstance(sel, int) else 0
-        s = slides[idx]
-
-        st.subheader(f"📄 Slide {s['slide_number']} Analysis")
-        left, right = st.columns([3, 2])
+        st.subheader("📑 Slide Analysis")
         
-        with left:
+        if HYDRALIT_AVAILABLE:
+            menu = [{"id": i, "label": f"Slide {d['slide_number']}", "icon": "bi-easel"} 
+                   for i, d in enumerate(slides)]
+            sel = hc.nav_bar(menu, sticky_mode="pinned", key="nav")
+            idx = sel if isinstance(sel, int) else 0
+        else:
+            # Fallback to selectbox if hydralit not available
+            idx = st.selectbox(
+                "Select slide to view:",
+                options=range(len(slides)),
+                format_func=lambda x: f"Slide {slides[x]['slide_number']}"
+            )
+        
+        current_slide = slides[idx]
+        
+        # Slide Content
+        col1, col2 = st.columns([3, 2])
+        
+        with col1:
             with st.container(border=True):
-                st.markdown("#### 📝 Summary")
+                st.markdown("#### 📝 Content Summary")
                 st.write(slide_sums[idx])
             
             with st.container(border=True):
-                st.markdown("#### 🎨 Design Tips")
+                st.markdown("#### 🎨 Design Suggestions")
                 st.write(design_notes[idx])
             
-            if s["has_notes"]:
+            if current_slide["has_notes"]:
                 with st.expander("🗒️ Presenter Notes"):
-                    st.info(s["notes_text"])
+                    st.info(current_slide["notes_text"])
         
-        with right:
+        with col2:
             with st.container(border=True):
                 st.markdown("#### 🖼️ Recommended Layout")
                 st.write(layouts[idx])
@@ -347,100 +368,47 @@ def main():
                 st.markdown("#### 📊 Data Visualization")
                 st.write(charts[idx])
             
-            with st.expander("📜 Raw Slide Content"):
-                st.text(s["slide_text"])
+            with st.expander("📜 Raw Content"):
+                st.text(current_slide["slide_text"])
         
+        # Visual Suggestions
         st.divider()
-
-        # Visualisation + colour scheme section
-        st.markdown("## 🖌️ Visual Enhancement")
-        p_state = f"prompt_state_{s['slide_number']}"
-        p1_key = f"prompt1_{s['slide_number']}"
-        p2_key = f"prompt2_{s['slide_number']}"
-        c_state = f"color_state_{s['slide_number']}"
-        c_key   = f"color_{s['slide_number']}"
+        st.subheader("🖌️ Visual Enhancements")
         
-        if p_state not in st.session_state:
-            st.session_state[p_state] = False
-        if c_state not in st.session_state:
-            st.session_state[c_state] = False
-
-        vis_btn_col, color_btn_col = st.columns(2)
-        if vis_btn_col.button("💡 Generate Visual Prompts", key=f"vis_btn_{s['slide_number']}"):
-            st.session_state[p_state] = True
-        if color_btn_col.button("🎨 Suggest Color Scheme", key=f"col_btn_{s['slide_number']}"):
-            st.session_state[c_state] = True
-
-        # process prompts
-        if st.session_state[p_state] and p1_key not in st.session_state:
-            with st.spinner("Generating visual ideas..."):
-                enriched = (
-                    f"Slide content: {s['slide_text']}\nDesign tips: {design_notes[idx]}\n"
-                    f"Chart suggestion: {charts[idx]}"
+        if st.button("💡 Generate Visual Ideas", key=f"vis_{idx}"):
+            with st.spinner("Creating visual concepts..."):
+                visual_prompt = generate_image_prompt(
+                    f"{slide_sums[idx]}\nDesign tips: {design_notes[idx]}",
+                    ctx
                 )
-                p1 = generate_enhanced_image_prompt(enriched, ctx)
-                p2 = generate_second_image_option(enriched, ctx, p1)
-                st.session_state[p1_key] = p1
-                st.session_state[p2_key] = p2
+                st.session_state[f"visual_{idx}"] = visual_prompt
         
-        if st.session_state[c_state] and c_key not in st.session_state:
-            with st.spinner("Generating color palette..."):
-                scheme = chat(
-                    "Presentation design expert: give 3‑5 hex colours as bullet list for this context.",
-                    f"Context JSON: {json.dumps(ctx)}\nSlide content: {s['slide_text']}",
-                    0.4,
-                )
-                st.session_state[c_key] = scheme
-
-        # display outputs
-        if p1_key in st.session_state or c_key in st.session_state:
-            tabs = st.tabs(["🖼️ Visual Prompts", "🎨 Color Scheme"])
-            
-            with tabs[0]:
-                if p1_key in st.session_state:
-                    cols = st.columns(2)
-                    with cols[0]:
-                        st.markdown("**Option 1**")
-                        st.code(st.session_state[p1_key], language="text")
-                    with cols[1]:
-                        st.markdown("**Option 2**")
-                        st.code(st.session_state[p2_key], language="text")
-                else:
-                    st.info("Press the 'Generate Visual Prompts' button above")
-            
-            with tabs[1]:
-                if c_key in st.session_state:
-                    st.markdown("**Suggested color scheme:**")
-                    st.markdown(st.session_state[c_key])
-                else:
-                    st.info("Press the 'Suggest Color Scheme' button above")
+        if f"visual_{idx}" in st.session_state:
+            with st.expander("🖼️ Visual Concept"):
+                st.markdown("**Image Prompt:**")
+                st.code(st.session_state[f"visual_{idx}"], language="text")
         
+        # Chatbot
         st.divider()
-
-        # Chatbot section
-        st.markdown("## 💬 Presentation Chatbot")
-        st.caption("Ask questions about the presentation content")
+        st.subheader("💬 Presentation Chatbot")
         
         if "messages" not in st.session_state:
             st.session_state.messages = []
         
-        # Display chat messages
-        for m in st.session_state.messages:
-            with st.chat_message(m["role"]):
-                st.write(m["content"])
+        for msg in st.session_state.messages:
+            with st.chat_message(msg["role"]):
+                st.write(msg["content"])
         
-        # Chat input
-        q = st.chat_input("Ask a question about the presentation...")
-        if q:
-            st.session_state.messages.append({"role": "user", "content": q})
+        if prompt := st.chat_input("Ask about the presentation..."):
+            st.session_state.messages.append({"role": "user", "content": prompt})
             with st.chat_message("assistant"):
                 with st.spinner("Thinking..."):
-                    a = chat(
-                        system="Answer strictly from the reference presentation below.",
-                        user=q + "\n\nReference:\n" + st.session_state.corpus,
+                    response = chat(
+                        "Answer questions about this presentation:",
+                        f"Question: {prompt}\n\nPresentation Content:\n{deck_sum}"
                     )
-                    st.write(a)
-            st.session_state.messages.append({"role": "assistant", "content": a})
+                    st.write(response)
+            st.session_state.messages.append({"role": "assistant", "content": response})
 
 if __name__ == "__main__":
     main()
